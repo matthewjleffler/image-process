@@ -2,8 +2,8 @@ import sys
 import os
 import imagehash
 import re
-from functools import cmp_to_key
 from PIL import Image
+from collections import defaultdict
 
 makeChanges = True
 imageExtensions = [
@@ -16,89 +16,70 @@ imageExtensions = [
 ]
 badfolder = '__remove'
 reportFile = '__report.txt'
-hashCutoff = 1
 
 # Sort folder by natural numbers
-def atoi(text):
+def atoi(text: str):
   return int(text) if text.isdigit() else text
 
-def natural_keys(text):
+def natural_keys(text: str, dirName: str):
+  init = [1]
+  if text.lower().startswith(dirName.lower()):
+    init = [0]
+
   '''
   alist.sort(key=natural_keys) sorts in human order
   http://nedbatchelder.com/blog/200712/human_sorting.html
   (See Toothy's implementation in the comments)
   '''
-  return [ atoi(c) for c in re.split(r'(\d+)', text) ]
+  return init + [ atoi(c) for c in re.split(r'(\d+)', text) ]
 
 # Cleans a folder
-def cleanFolderRecursive(dirPath, report):
+def cleanFolderRecursive(dirPath: str, report: list):
   # Ignore already cleaned paths
-  dirName = os.path.basename(dirPath)
+  dirName: str = os.path.basename(os.path.dirname(dirPath))
   if dirName == badfolder:
     return
 
   # Cache vars
-  badPath = f'{dirPath}/{badfolder}'
-  calculatedImages = []
-  calculatedFiles = []
-  filePaths = sorted(os.listdir(dirPath), key=natural_keys)
-
-  # Recurse first. Double iterates, but doesn't blow up memory (theoretically)
-  for filePath in filePaths:
-    fullFilePath = f'{dirPath}/{filePath}'
-    if os.path.isdir(fullFilePath):
-      cleanFolderRecursive(fullFilePath, report)
-
-  print(f'Checking {dirPath}...')
+  badPath = os.path.join(dirPath, badfolder)
+  images = defaultdict(list)
+  files = defaultdict(list)
+  filePaths = sorted(os.listdir(dirPath), key=lambda path: natural_keys(path, dirName))
 
   # Calcualte stats for each file
+  print(f'Checking {dirPath}...')
+  hasDuplicates = False
   for filePath in filePaths:
-    fullFilePath = f'{dirPath}/{filePath}'
+    fullFilePath = os.path.join(dirPath, filePath)
+
     if os.path.isdir(fullFilePath):
+      cleanFolderRecursive(fullFilePath, report)
       continue
     if filePath == reportFile:
       continue
+
     duplicateExtension = os.path.splitext(filePath)[1].lower()
-    stat = os.stat(fullFilePath)
-    if duplicateExtension not in imageExtensions:
-      calculatedFiles.append((fullFilePath, stat.st_size, filePath))
+    try:
+      size = os.stat(fullFilePath).st_size
+    except:
       continue
+
+    # Non-image
+    if duplicateExtension not in imageExtensions:
+      fileList = files[size]
+      fileList.append((fullFilePath, size, filePath))
+      hasDuplicates = hasDuplicates or len(fileList) > 1
+      continue
+
+    # Image
     try:
       hashValue = imagehash.average_hash(Image.open(fullFilePath))
     except:
       print(f'Failed to parse image: {fullFilePath}')
       continue
-    calculatedImages.append((fullFilePath, stat.st_size, hashValue, filePath))
-
-  # Loop through and identify similar images
-  hasDuplicates = False
-  similarImageLists = {}
-  for calc in calculatedImages:
-    calcHash = calc[2]
-    foundSimilar = False
-    for similarHash, items in similarImageLists.items():
-      delta = calcHash - similarHash
-      if delta < hashCutoff:
-        foundSimilar = True
-        hasDuplicates = True
-        items.append(calc)
-        break
-    if not foundSimilar:
-      similarImageLists[calcHash] = [calc]
-
-  # Loop through and identify other similar files
-  similarFileLists = {}
-  for calc in calculatedFiles:
-    calcSize = calc[1]
-    foundSimilar = False
-    for similarSize, items in similarFileLists.items():
-      if similarSize == calcSize:
-        foundSimilar = True
-        hasDuplicates = True
-        items.append(calc)
-        break
-    if not foundSimilar:
-      similarFileLists[calcSize] = [calc]
+    imageList = images[hashValue]
+    imageList.append((fullFilePath, size, hashValue, filePath))
+    hasDuplicates = hasDuplicates or len(imageList) > 1
 
   if hasDuplicates:
     # Create target folder if it doesn't exist
@@ -108,51 +89,64 @@ def cleanFolderRecursive(dirPath, report):
   else:
     report.append(f'Found no duplicates in {dirPath}:\n')
 
-  baseFileIdx = 0
   # Move images
-  for similarImageList in similarImageLists.values():
+  baseFileIdx = 0
+  for similarList in images.values():
     # Find the largest image, others will be moved
-    max = similarImageList[0]
-    for item in similarImageList:
+    max = similarList[0]
+    for item in similarList:
       if item[1] > max[1]:
         max = item
 
+    # Find next available file path
     maxExtension = os.path.splitext(max[3])[1].lower() # Max file extension
-    maxNewName = f'{dirName.lower()}_{baseFileIdx}'.replace(' ', '_')
-    maxNewPath = f'{dirPath}/{maxNewName}{maxExtension}'
-    baseFileIdx += 1
+    while True:
+      maxNewName = f'{dirName.lower()}_{baseFileIdx}'.replace(' ', '_')
+      maxNewFile =  f'{maxNewName}{maxExtension}'
+      maxNewPath = os.path.join(dirPath, maxNewFile)
+      baseFileIdx += 1
+      if not os.path.exists(maxNewPath) or max[0] == maxNewPath:
+        break
 
+    # Rename if that's not already our name
     if makeChanges and max[0] != maxNewPath:
-      report.append(f'  Keep:     \'{max[3]}\' -> \'{maxNewName}{maxExtension}\'  ({max[1]} bytes)\n')
+      report.append(f'  Keep:     \'{max[3]}\' -> \'{maxNewFile}\'  ({max[1]} bytes)\n')
       os.rename(max[0], maxNewPath)
 
     # Move non-max files to badPath
     duplicateIdx = 0
-    for item in similarImageList:
+    for item in similarList:
       if item is max:
         continue
       duplicateExtension = os.path.splitext(item[3])[1].lower() # Moved file extension
       # Keep picking the next largest file name until one doesn't exist
       while True:
         duplicateTargetName = f'{maxNewName}_{duplicateIdx}'.replace(' ', '_')
-        duplicateTargetPath = f'{badPath}/{duplicateTargetName}{duplicateExtension}'
+        duplicateTargetFile = f'{duplicateTargetName}{duplicateExtension}'
+        duplicateTargetPath = os.path.join(badPath, duplicateTargetFile)
         duplicateIdx += 1
         if not os.path.exists(duplicateTargetPath):
           break
-      report += f'    Remove: \'{item[3]}\' -> \'{duplicateTargetName}{duplicateExtension}\' ({item[1]} bytes)\n'
+      report += f'    Remove: \'{item[3]}\' -> \'{duplicateTargetFile}\' ({item[1]} bytes)\n'
       if makeChanges:
         os.rename(item[0], duplicateTargetPath)
 
   # Move other files
-  for similarFileList in similarFileLists.values():
+  for similarFileList in files.values():
     first = similarFileList[0]
     firstExtension = os.path.splitext(first[2])[1].lower()
-    firstNewName = f'{dirName.lower()}_{baseFileIdx}'.replace(' ', '_')
-    firstNewPath = f'{dirPath}/{firstNewName}{firstExtension}'
-    baseFileIdx += 1
+    # Find the first available open file path
+    while True:
+      firstNewName = f'{dirName.lower()}_{baseFileIdx}'.replace(' ', '_')
+      firstNewFile = f'{firstNewName}{firstExtension}'
+      firstNewPath = os.path.join(dirPath, firstNewFile)
+      baseFileIdx += 1
+      if not os.path.exists(firstNewPath) or first[0] == firstNewPath:
+        break
 
+    # Rename to that file path if we aren't using that name already
     if makeChanges and first[0] != firstNewPath:
-      report.append(f'  Keep:     \'{first[2]}\' -> \'{firstNewName}{firstExtension}\'  ({first[1]} bytes)\n')
+      report.append(f'  Keep:     \'{first[2]}\' -> \'{firstNewFile}\'  ({first[1]} bytes)\n')
       os.rename(first[0], firstNewPath)
 
     # Move other files to badPath
@@ -164,11 +158,12 @@ def cleanFolderRecursive(dirPath, report):
       # Keep picking the next largest file name until one doesn't exist
       while True:
         duplicateTargetName = f'{firstNewName}_{duplicateIdx}'.replace(' ', '_')
-        duplicateTargetPath = f'{badPath}/{duplicateTargetName}{duplicateExtension}'
+        duplicateTargetFile = f'{duplicateTargetName}{duplicateExtension}'
+        duplicateTargetPath = os.path.join(badPath, duplicateTargetFile)
         duplicateIdx += 1
         if not os.path.exists(duplicateTargetPath):
           break
-      report += f'    Remove: \'{item[2]}\' -> \'{duplicateTargetName}{duplicateExtension}\' ({item[1]} bytes)\n'
+      report += f'    Remove: \'{item[2]}\' -> \'{duplicateTargetFile}\' ({item[1]} bytes)\n'
       if makeChanges:
         os.rename(item[0], duplicateTargetPath)
 
@@ -183,7 +178,9 @@ def compareImages():
     return
 
   # Calc path
-  path = f'./{sys.argv[1]}'
+  path = sys.argv[1]
+  if path.endswith('\"'):
+    path = path[:len(path)-1]
 
   # Can't work on non-existent path
   if not os.path.exists(path):
@@ -196,7 +193,7 @@ def compareImages():
 
   # Write report
   if len(report) > 0:
-    reportPath = f'{path}/{reportFile}'
+    reportPath = os.path.join(path, reportFile)
     print(f'Writing report to: {reportPath}')
     reportWrite = open(reportPath, 'w')
     reportWrite.write(''.join(report))
